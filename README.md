@@ -4,37 +4,103 @@ A dependency-free (Python stdlib only) [MCP](https://modelcontextprotocol.io) se
 [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit) web UI. It wraps the UI's HTTP API so
 an MCP client such as Claude can manage datasets, run training jobs and inspect results.
 
-## Tools
+## Commands
 
-| Area | Tools |
-|---|---|
-| System | `gpu_status`, `get_settings` (secrets redacted), `list_queues`, `queue_control` |
-| Jobs | `list_presets`, `new_job`, `validate_job`, `list_jobs`, `get_job`, `create_job`, `clone_job`, `start_job`, `stop_job`, `wait_for_job`, `job_control`, `job_notes`, `job_log` |
-| Results | `job_samples`, `get_sample`, `job_files`, `job_loss`, `request_download` |
-| Datasets | `list_datasets`, `create_dataset`, `list_dataset_images`, `dataset_summary`, `get_dataset_image`, `add_to_dataset`, `request_upload`, `set_captions`, `get_caption` |
-| Destructive (off by default) | `delete_image`, `delete_dataset`, `delete_job` |
+`?` marks optional arguments. Jobs are addressed by `id` (from `list_jobs`), datasets by folder name.
+
+### Datasets
+| Command | Arguments | What it does |
+|---|---|---|
+| `list_datasets` | | Dataset folder names |
+| `create_dataset` | `name` | Create an empty dataset (`add_to_dataset` also creates on demand) |
+| `list_dataset_images` | `dataset`, `limit?` | Image filenames in a dataset |
+| `dataset_summary` | `dataset`, `sample?` | Image count and a caption spot-check (missing / average length) |
+| `get_dataset_image` | `dataset`, `filename` | View one image inline (up to 3MB) |
+| `request_upload` | `dataset`, `ttl_seconds?` | **Bulk path.** Returns an upload URL and a `curl` command; run it where the files are |
+| `add_to_dataset` | `dataset`, `items[]` | Small batches. Item: `data` (base64) + `filename`, or `source` (URL), plus optional `caption` |
+| `set_captions` | `dataset`, `captions` | `{filename: text}`: write or overwrite captions |
+| `get_caption` | `dataset`, `filename` | Read one caption |
+
+### Jobs
+| Command | Arguments | What it does |
+|---|---|---|
+| `list_presets` | | Presets for `new_job` |
+| `new_job` | `name`, `dataset`, `preset?`, `trigger_word?`, `steps?`, `gpu_ids?`, `overrides?`, `start?`, `dry_run?`, `force?` | Build, validate and create a LoRA job; `start=true` also runs it |
+| `validate_job` | `id?` or `job_config?` | Pre-flight: dataset, images, captions, steps, model, free GPU memory |
+| `clone_job` | `id`, `name`, `overrides?` | Copy an existing job's config (with changes) as a new job |
+| `create_job` | `name`, `job_config`, `gpu_ids?`, `id?` | Create from a full config object (or update with `id`) |
+| `start_job` | `id`, `start_queue?` | Queue the job and start its GPU queue if stopped |
+| `stop_job` | `id` | Graceful stop |
+| `job_control` | `id`, `action` | `save_now`, `sample_now`, `kill`, `mark_stopped` |
+| `list_jobs` | `only_active?` | Jobs, newest first |
+| `get_job` | `id`, `include_config?` | One job, including its config |
+| `job_notes` | `id`, `content?` | Read notes, or write them |
+| `wait_for_job` | `id`, `timeout_seconds?`, `poll_seconds?` | Block until finished or timeout (default 120s, max 600s) |
+
+### Monitoring and results
+| Command | Arguments | What it does |
+|---|---|---|
+| `job_log` | `id`, `tail_chars?` | Tail of the training log |
+| `job_loss` | `id`, `keys?`, `since_step?`, `points?` | Compact loss summary: last, min and a few spaced points |
+| `job_samples` | `id`, `last?` | Paths of generated sample files |
+| `get_sample` | `path` | View a sample image inline (up to 3MB) |
+| `job_files` | `id` | Checkpoints (`.safetensors`) and their sizes |
+| `request_download` | `id`, `path`, `ttl_seconds?` | URL and `curl -o` command to pull a checkpoint or sample to your machine (HTTP mode) |
+
+### System
+| Command | Arguments | What it does |
+|---|---|---|
+| `gpu_status` | | GPU memory and utilisation |
+| `list_queues` | | GPU queues and whether each is running |
+| `queue_control` | `queue_id`, `action` | `start` or `stop` a queue |
+| `get_settings` | | UI folders and settings (secrets redacted) |
+
+### Destructive (disabled unless `AITK_MCP_ALLOW_DELETE=true`)
+| Command | Arguments | What it does |
+|---|---|---|
+| `delete_image` | `dataset`, `filename`, `confirm` | Delete an image and its caption |
+| `delete_dataset` | `dataset`, `confirm` | Delete a whole dataset |
+| `delete_job` | `id`, `confirm` | Delete a job **and its output folder and checkpoints** |
+
+`confirm` must equal the filename, dataset name or job name.
+
+## Quick start: images to LoRA
+
+1. `request_upload` the dataset, then run the returned `curl` with your images and `.txt` captions
+   (or `add_to_dataset` for a handful).
+2. `dataset_summary` to check counts and captions.
+3. `new_job` with `dry_run=true`, read the config, then run it again without `dry_run`
+   (`start=true` to launch).
+4. `wait_for_job`, plus `job_loss`, `job_log` and `get_sample` to watch progress.
+5. `job_files`, then `request_download` for the checkpoint you want.
+
+If you use Claude Code, install the bundled skill (below) and ask it to "train a LoRA from these images".
+
+## Skill
+
+`skill/ai-toolkit/SKILL.md` teaches Claude the workflow above, the safety rules and the pitfalls. Install it where
+Claude can see it:
+
+```
+mkdir -p ~/.claude/skills && cp -r skill/ai-toolkit ~/.claude/skills/
+```
+
+## Details
 
 `new_job` builds a LoRA job from a preset (`flux2_dev_lora`, `flex1_lora`) with dotted-path
-`overrides`, validates it, and can start it in one call (`start=true`; refused on validation errors
-unless `force=true`). `start_job` also starts the job's GPU queue if it is stopped (pass
-`start_queue=false` to skip). Preset paths are as seen inside the ai-toolkit container
+`overrides` (for example `{"config.process.0.network.linear": 16}`). It validates first and refuses to
+start a job with errors unless `force=true`. Preset paths are as seen inside the ai-toolkit container
 (`AITK_CONTAINER_ROOT`, default `/app/ai-toolkit`).
 
-`job_control` actions (`save_now`, `sample_now`, `kill`, `mark_stopped`) depend on the UI version;
-a missing route is reported as such.
+`start_job` also starts the job's GPU queue, since a queued job on a stopped queue never runs.
 
-### Getting results out
+`job_control` actions depend on the UI version; a missing route is reported as such.
 
-`request_download(id, path)` (HTTP mode) returns a short-lived URL and a `curl -o` command, so a
-trained LoRA goes straight from the server to the client machine instead of through the model.
-Only paths the UI lists for that job (`job_files` / `job_samples`) can be requested.
+`request_download` only hands out files the UI itself lists for that job (`job_files` / `job_samples`).
 
-### Deleting
-
-Deletion tools refuse unless the server runs with `AITK_MCP_ALLOW_DELETE=true` **and** the call passes
-`confirm=` equal to the image filename / dataset name / job name. Dataset and file names are
-validated as single path segments before any request is made. `delete_job` also removes the job's
-output folder and checkpoints.
+Deletion tools refuse unless the server runs with `AITK_MCP_ALLOW_DELETE=true` and the call passes a matching
+`confirm`. Names are validated as single path segments before any request is made. `delete_job` removes the
+job's output folder and checkpoints too.
 
 ## Modes
 

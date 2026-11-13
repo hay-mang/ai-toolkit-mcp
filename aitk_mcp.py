@@ -44,7 +44,11 @@ def api(method, path, params=None, body=None):
         req.add_header("Authorization", f"Bearer {TOKEN}")
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read() or "null")
+            raw = r.read()
+        try:
+            return json.loads(raw or "null")
+        except ValueError:  # some routes (e.g. caption/get) answer with plain text
+            return raw.decode(errors="replace")
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"HTTP {e.code} from {path}: {e.read().decode(errors='replace')[:500]}")
     except urllib.error.URLError as e:
@@ -195,6 +199,7 @@ def list_datasets(a):
 
 
 def list_dataset_images(a):
+    _safe_name(a["dataset"])
     r = api("POST", "/api/datasets/listImages", body={"datasetName": a["dataset"]})
     imgs = r.get("images", [])
     lim = int(a.get("limit", 200))
@@ -203,6 +208,7 @@ def list_dataset_images(a):
 
 def add_to_dataset(a):
     """Upload images (and optional captions) into a dataset; creates it if new."""
+    _safe_name(a["dataset"])
     items, uploaded, errors = a["items"], [], []
     files, captions = [], {}
     for it in items:
@@ -228,10 +234,12 @@ def add_to_dataset(a):
 
 def set_captions(a):
     """captions: {filename: text}. Filenames as shown by list_dataset_images."""
+    _safe_name(a["dataset"])
     root = _dataset_root(a["dataset"])
     done, errors = 0, []
     for fn, cap in a["captions"].items():
         try:
+            _safe_rel(fn)
             _set_caption(root, fn, cap)
             done += 1
         except Exception as e:
@@ -240,8 +248,11 @@ def set_captions(a):
 
 
 def get_caption(a):
+    _safe_name(a["dataset"])
+    _safe_rel(a["filename"])
     root = _dataset_root(a["dataset"])
-    return api("POST", "/api/caption/get", body={"imgPath": root + a["filename"], "ext": "txt"})
+    txt = api("POST", "/api/caption/get", body={"imgPath": root + a["filename"], "ext": "txt"})
+    return {"filename": a["filename"], "caption": txt if isinstance(txt, str) else ""}
 
 
 # ---- out-of-band uploads (HTTP mode): the model gets a curl command, never the bytes ----
@@ -251,6 +262,7 @@ MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
 def request_upload(a):
+    _safe_name(a["dataset"])
     if ALLOW_LOCAL_PATHS:
         raise RuntimeError("request_upload only exists on the HTTP server; in stdio mode use add_to_dataset with local `source` paths")
     ttl = max(60, min(int(a.get("ttl_seconds", 900)), 3600))
@@ -332,21 +344,30 @@ def job_loss(a):
     return {"keys": r.get("keys"), "series": out}
 
 
-def get_sample(a):
-    """Return one sample image inline (<=3MB) so Claude can look at it."""
-    path = a["path"]
+def _image_content(path, root_hint=None):
     ext = os.path.splitext(path)[1].lower()
     mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext)
     if not mime:
-        raise RuntimeError("only png/jpg/webp samples can be returned inline")
+        raise RuntimeError("only png/jpg/webp can be returned inline")
     req = urllib.request.Request(BASE + "/api/files/" + urllib.parse.quote(path.lstrip("/"), safe="/"))
     if TOKEN:
         req.add_header("Authorization", f"Bearer {TOKEN}")
     with urllib.request.urlopen(req, timeout=60) as r:
         raw = r.read(3 * 1024 * 1024 + 1)
     if len(raw) > 3 * 1024 * 1024:
-        raise RuntimeError("sample is over 3MB; open it in the UI instead")
+        raise RuntimeError("image is over 3MB; open it in the UI instead")
     return {"_image": (mime, base64.b64encode(raw).decode())}
+
+
+def get_sample(a):
+    """Return one sample image inline (<=3MB) so Claude can look at it."""
+    return _image_content(a["path"])
+
+
+def get_dataset_image(a):
+    _safe_name(a["dataset"])
+    _safe_rel(a["filename"])
+    return _image_content(_dataset_root(a["dataset"]) + a["filename"])
 
 
 def _set_path(obj, dotted, value):
@@ -466,11 +487,242 @@ def new_job(a):
         _set_path(cfg, path, val)
     if a.get("dry_run"):
         return {"job_config": cfg}
+    _safe_name(a["name"])
+    v = validate_job({"job_config": cfg})
+    if a.get("start") and not v["ok"] and not a.get("force"):
+        return {"created": False, "validation": v, "note": "not created: fix the errors or pass force=true"}
     job = api("POST", "/api/jobs", body={"name": a["name"], "gpu_ids": str(a.get("gpu_ids", "0")), "job_config": cfg})
     out = _slim(job)
+    out["validation"] = v
     if a.get("start"):
         out["start"] = start_job({"id": job["id"]})
     return out
+
+
+# ---- safety helpers ------------------------------------------------------------
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_name(name):
+    """Dataset/job folder names: one path segment, no traversal. Some UI routes join
+    the name into a path without checking (datasets/delete), so we check first."""
+    if not isinstance(name, str) or not _NAME_RE.match(name) or ".." in name:
+        raise RuntimeError(f"invalid name {name!r}: use letters, digits, . _ - (no slashes)")
+    return name
+
+
+def _safe_rel(path):
+    if not isinstance(path, str) or not path or path.startswith("/") or ".." in path.split("/"):
+        raise RuntimeError(f"invalid relative path {path!r}")
+    return path
+
+
+def _require_delete(a, expected):
+    if os.environ.get("AITK_MCP_ALLOW_DELETE", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        raise RuntimeError("deletion is disabled on this server; set AITK_MCP_ALLOW_DELETE=true to enable")
+    if a.get("confirm") != expected:
+        raise RuntimeError(f"to confirm, pass confirm={expected!r}")
+
+
+# ---- datasets: create / delete / inspect -----------------------------------------
+def create_dataset(a):
+    _safe_name(a["name"])
+    return api("POST", "/api/datasets/create", body={"name": a["name"]})
+
+
+def delete_dataset(a):
+    _safe_name(a["dataset"])
+    _require_delete(a, a["dataset"])
+    return api("POST", "/api/datasets/delete", body={"name": a["dataset"]})
+
+
+def delete_image(a):
+    _safe_name(a["dataset"])
+    _safe_rel(a["filename"])
+    _require_delete(a, a["filename"])
+    root = _dataset_root(a["dataset"])
+    return api("POST", "/api/img/delete", body={"imgPath": root + a["filename"]})
+
+
+def dataset_summary(a):
+    """Image count plus a caption spot-check, so problems show up before training."""
+    _safe_name(a["dataset"])
+    r = api("POST", "/api/datasets/listImages", body={"datasetName": a["dataset"]})
+    imgs, root = r.get("images", []), r.get("root", "")
+    n = int(a.get("sample", 10))
+    pick = [imgs[round(i * (len(imgs) - 1) / max(n - 1, 1))] for i in range(min(n, len(imgs)))] if imgs else []
+    missing, lens = [], []
+    for im in dict.fromkeys(pick):
+        txt = api("POST", "/api/caption/get", body={"imgPath": root + im, "ext": a.get("caption_ext", "txt")})
+        txt = txt if isinstance(txt, str) else ""
+        (lens.append(len(txt.split())) if txt.strip() else missing.append(im))
+    return {"images": len(imgs), "checked": len(pick), "missing_captions": missing,
+            "avg_caption_words": round(sum(lens) / len(lens), 1) if lens else 0}
+
+
+# ---- jobs: controls, notes, delete, wait -----------------------------------------
+_CONTROLS = ("save_now", "sample_now", "kill", "mark_stopped")
+
+
+def job_control(a):
+    """save_now / sample_now: act at the next step. kill: force-kill a hung stop. mark_stopped: fix a stale 'running' row."""
+    if a["action"] not in _CONTROLS:
+        raise RuntimeError(f"action must be one of {_CONTROLS}")
+    try:
+        return _slim(api("GET", f"/api/jobs/{a['id']}/{a['action']}"))
+    except RuntimeError as e:
+        if "HTTP 404" in str(e):
+            raise RuntimeError(f"this UI version has no '{a['action']}' route ({e})")
+        raise
+
+
+def job_notes(a):
+    if a.get("content") is None:
+        return api("GET", f"/api/jobs/{a['id']}/notes")
+    return api("POST", f"/api/jobs/{a['id']}/notes", body={"content": a["content"]})
+
+
+def delete_job(a):
+    job = api("GET", "/api/jobs", {"id": a["id"]})
+    if not job:
+        raise RuntimeError("job not found")
+    _require_delete(a, job["name"])
+    api("GET", f"/api/jobs/{a['id']}/delete")  # also removes the job's output folder
+    return {"deleted": job["name"], "note": "output folder and checkpoints were removed too"}
+
+
+TERMINAL = ("completed", "stopped", "error")
+
+
+def wait_for_job(a):
+    """Block until the job reaches a terminal state or the timeout (default 120s, max 600s)."""
+    limit = max(5, min(int(a.get("timeout_seconds", 120)), 600))
+    poll = max(2, min(int(a.get("poll_seconds", 5)), 60))
+    end = time.time() + limit
+    while True:
+        job = api("GET", "/api/jobs", {"id": a["id"]})
+        if not job:
+            raise RuntimeError("job not found")
+        done = job.get("status") in TERMINAL
+        if done or time.time() + poll > end:
+            r = _slim(job)
+            r["finished"] = done
+            return r
+        time.sleep(poll)
+
+
+# ---- validation ------------------------------------------------------------------
+def validate_job(a):
+    """Static checks on a job (by id) or a config object, plus live dataset/queue/GPU checks."""
+    cfg = a.get("job_config")
+    if cfg is None:
+        job = api("GET", "/api/jobs", {"id": a["id"]})
+        if not job:
+            raise RuntimeError("job not found")
+        cfg = job["job_config"]
+    if isinstance(cfg, str):
+        cfg = json.loads(cfg)
+    errors, warnings, info = [], [], {}
+    try:
+        proc = cfg["config"]["process"][0]
+    except Exception:
+        return {"ok": False, "errors": ["job_config.config.process[0] missing"], "warnings": [], "info": {}}
+    model, train = proc.get("model", {}), proc.get("train", {})
+    if not model.get("name_or_path"):
+        errors.append("model.name_or_path is empty")
+    if not model.get("arch"):
+        warnings.append("model.arch is not set")
+    if int(train.get("steps", 0)) <= 0:
+        errors.append("train.steps must be > 0")
+    if not (proc.get("sample") or {}).get("samples") and not train.get("disable_sampling"):
+        warnings.append("no sample prompts; samples will be empty")
+    ds_list = proc.get("datasets") or []
+    if not ds_list:
+        errors.append("no datasets configured")
+    names = None
+    for i, ds in enumerate(ds_list):
+        fp = str(ds.get("folder_path", ""))
+        m = re.search(r"/datasets/([^/]+)/?$", fp)
+        if not m or fp.startswith("/path/to"):
+            errors.append(f"datasets[{i}].folder_path {fp!r} is not a folder under .../datasets/<name>")
+            continue
+        name = m.group(1)
+        names = names if names is not None else api("GET", "/api/datasets/list")
+        if name not in names:
+            errors.append(f"dataset {name!r} does not exist (have: {names})")
+            continue
+        try:
+            sm = dataset_summary({"dataset": name, "caption_ext": ds.get("caption_ext", "txt")})
+        except RuntimeError as e:
+            errors.append(f"dataset {name!r}: {e}")
+            continue
+        info[f"dataset:{name}"] = sm
+        if sm["images"] == 0:
+            errors.append(f"dataset {name!r} has no images")
+        if sm["missing_captions"] and not ds.get("default_caption"):
+            warnings.append(f"dataset {name!r}: {len(sm['missing_captions'])}/{sm['checked']} sampled images have no caption (and no default_caption)")
+        elif 0 < sm["images"] < 10:
+            warnings.append(f"dataset {name!r} has only {sm['images']} images")
+    tw = proc.get("trigger_word")
+    try:
+        gpus = api("GET", "/api/gpu").get("gpus", [])
+        if gpus:
+            free = gpus[0].get("memory", {}).get("free")
+            info["gpu_free_mb"] = free
+        else:
+            warnings.append("no GPU reported by the UI")
+    except RuntimeError as e:
+        warnings.append(f"GPU check failed: {e}")
+    return {"ok": not errors, "errors": errors, "warnings": warnings, "info": info}
+
+
+# ---- settings (read-only, secrets redacted) ----------------------------------------
+def get_settings(a):
+    r = api("GET", "/api/settings")
+    if isinstance(r, dict):
+        r = {k: ("<set>" if v else "<empty>") if re.search("token|key|secret|password", k, re.I) else v for k, v in r.items()}
+    return r
+
+
+# ---- downloads (HTTP mode): mirror of request_upload ---------------------------------
+DL_TICKETS = {}  # ticket -> (absolute path on the server, expires_at)
+_DL_OK = (".safetensors", ".pt", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".txt", ".log", ".yaml", ".json")
+
+
+def request_download(a):
+    if ALLOW_LOCAL_PATHS:
+        raise RuntimeError("request_download only exists on the HTTP server; in stdio mode fetch via the UI's /api/files/ route")
+    path = a["path"]
+    # only files the UI itself reports for this job may be handed out
+    allowed = {f["path"] for f in api("GET", f"/api/jobs/{a['id']}/files").get("files", [])}
+    allowed |= set(api("GET", f"/api/jobs/{a['id']}/samples").get("samples", []))
+    if path not in allowed:
+        raise RuntimeError("path must be one returned by job_files or job_samples for this job")
+    if not path.lower().endswith(_DL_OK):
+        raise RuntimeError("file type not allowed for download")
+    ttl = max(60, min(int(a.get("ttl_seconds", 900)), 3600))
+    now = time.time()
+    for t in [t for t, (_, exp) in DL_TICKETS.items() if exp < now]:
+        del DL_TICKETS[t]
+    ticket = secrets.token_urlsafe(24)
+    DL_TICKETS[ticket] = (path, now + ttl)
+    base = os.environ.get("AITK_PUBLIC_URL") or f"http://{getattr(_ctx, 'host', None) or 'SERVER:8676'}"
+    url = f"{base.rstrip('/')}/download/{ticket}"
+    name = os.path.basename(path)
+    return {"download_url": url, "expires_in_seconds": ttl, "file": name,
+            "how_to_use": f"Run from the machine that should receive it, with your shell tool: curl -fSL -o '{name}' {url}"}
+
+
+def stream_download(ticket, wfile_send):
+    """Open the file via the UI and hand (status, headers, response) to the HTTP handler."""
+    entry = DL_TICKETS.get(ticket)
+    if not entry or entry[1] < time.time():
+        return None
+    path = entry[0]
+    req = urllib.request.Request(BASE + "/api/files/" + urllib.parse.quote(path.lstrip("/"), safe="/"))
+    if TOKEN:
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+    return os.path.basename(path), urllib.request.urlopen(req, timeout=60)
 
 
 ID = {"id": {"type": "string", "description": "job id"}}
@@ -527,11 +779,23 @@ TOOLS = {
     "list_presets": (list_presets, "Available job presets for new_job.", {}, []),
     "new_job": (
         new_job,
-        "Create a LoRA training job from a preset in one call: name, dataset (folder name under datasets), optional trigger_word, steps, overrides (dotted paths, e.g. {\"config.process.0.network.linear\": 16}). start=true also queues it and starts the GPU queue. dry_run=true returns the config without creating. Check list_dataset_images first.",
+        "Create a LoRA training job from a preset in one call: name, dataset (folder name under datasets), optional trigger_word, steps, overrides (dotted paths, e.g. {\"config.process.0.network.linear\": 16}). It is validated first; start=true also queues it and starts the GPU queue (refused on validation errors unless force=true). dry_run=true returns the config without creating. Check list_dataset_images first.",
         {"name": {"type": "string"}, "dataset": {"type": "string"}, "preset": {"type": "string"}, "trigger_word": {"type": "string"},
-         "steps": {"type": "integer"}, "gpu_ids": {"type": "string"}, "overrides": {"type": "object"}, "start": {"type": "boolean"}, "dry_run": {"type": "boolean"}},
+         "steps": {"type": "integer"}, "gpu_ids": {"type": "string"}, "overrides": {"type": "object"}, "start": {"type": "boolean"}, "dry_run": {"type": "boolean"}, "force": {"type": "boolean"}},
         ["name", "dataset"],
     ),
+    "create_dataset": (create_dataset, "Create an empty dataset folder (add_to_dataset also creates on demand).", {"name": {"type": "string"}}, ["name"]),
+    "dataset_summary": (dataset_summary, "Image count + caption spot-check for a dataset.", {"dataset": {"type": "string"}, "sample": {"type": "integer"}}, ["dataset"]),
+    "get_dataset_image": (get_dataset_image, "View one dataset image inline (<=3MB).", {"dataset": {"type": "string"}, "filename": {"type": "string"}}, ["dataset", "filename"]),
+    "delete_image": (delete_image, "DESTRUCTIVE. Delete an image (and its caption). Needs AITK_MCP_ALLOW_DELETE=true on the server and confirm=<filename>.", {"dataset": {"type": "string"}, "filename": {"type": "string"}, "confirm": {"type": "string"}}, ["dataset", "filename", "confirm"]),
+    "delete_dataset": (delete_dataset, "DESTRUCTIVE. Delete a whole dataset folder. Needs AITK_MCP_ALLOW_DELETE=true and confirm=<dataset name>.", {"dataset": {"type": "string"}, "confirm": {"type": "string"}}, ["dataset", "confirm"]),
+    "job_control": (job_control, "save_now / sample_now (at next step), kill (force-kill a hung stop), mark_stopped (repair a stale running row).", {**ID, "action": {"type": "string", "enum": list(_CONTROLS)}}, ["id", "action"]),
+    "job_notes": (job_notes, "Read a job's notes, or write them by passing content.", {**ID, "content": {"type": "string"}}, ["id"]),
+    "delete_job": (delete_job, "DESTRUCTIVE. Delete a job AND its output folder/checkpoints. Needs AITK_MCP_ALLOW_DELETE=true and confirm=<job name>.", {**ID, "confirm": {"type": "string"}}, ["id", "confirm"]),
+    "wait_for_job": (wait_for_job, "Block until the job completes/stops/errors or timeout_seconds (default 120, max 600). Returns current status either way.", {**ID, "timeout_seconds": {"type": "integer"}, "poll_seconds": {"type": "integer"}}, ["id"]),
+    "validate_job": (validate_job, "Pre-flight check of a job (id) or a job_config: dataset exists/has images/captions, steps, model, GPU free memory.", {"id": {"type": "string"}, "job_config": {"type": "object"}}, []),
+    "get_settings": (get_settings, "UI settings (datasets/training folders); secrets redacted.", {}, []),
+    "request_download": (request_download, "Get a short-lived URL + curl command to pull a job's checkpoint or sample to the client machine without passing bytes through chat. path must come from job_files/job_samples. HTTP server only.", {**ID, "path": {"type": "string"}, "ttl_seconds": {"type": "integer"}}, ["id", "path"]),
     "queue_control": (
         queue_control,
         "Start or stop a GPU queue.",
@@ -657,8 +921,29 @@ def run_http(port):
             out = handle(msg)
             self._send(200, out) if out is not None else self._send(202)
 
-        def do_GET(self):  # no server-initiated stream
-            self._send(405, {"error": "use POST"})
+        def do_GET(self):
+            if not self.path.startswith("/download/"):  # no server-initiated MCP stream
+                return self._send(405, {"error": "use POST"})
+            ticket = self.path.split("?")[0][len("/download/"):]
+            try:
+                found = stream_download(ticket, None)
+            except Exception as e:
+                return self._send(502, {"error": f"upstream: {e}"})
+            if not found:
+                return self._send(403, {"error": "invalid or expired download ticket"})
+            name, resp = found
+            with resp:
+                self.send_response(200)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/octet-stream"))
+                if resp.headers.get("Content-Length"):
+                    self.send_header("Content-Length", resp.headers["Content-Length"])
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % re.sub(r'[^A-Za-z0-9._-]', "_", name))
+                self.end_headers()
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
 
     sys.stderr.write(f"aitk-mcp listening on :{port}/mcp -> {BASE} (client auth {'ON' if auth_on else 'OFF'})\n")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()

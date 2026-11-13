@@ -344,12 +344,17 @@ def job_loss(a):
     return {"keys": r.get("keys"), "series": out}
 
 
+def _files_url(path):
+    # whole absolute path as ONE url-encoded segment: the form every UI version accepts
+    return BASE + "/api/files/" + urllib.parse.quote(path, safe="")
+
+
 def _image_content(path, root_hint=None):
     ext = os.path.splitext(path)[1].lower()
     mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(ext)
     if not mime:
         raise RuntimeError("only png/jpg/webp can be returned inline")
-    req = urllib.request.Request(BASE + "/api/files/" + urllib.parse.quote(path.lstrip("/"), safe="/"))
+    req = urllib.request.Request(_files_url(path))
     if TOKEN:
         req.add_header("Authorization", f"Bearer {TOKEN}")
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -719,7 +724,7 @@ def stream_download(ticket, wfile_send):
     if not entry or entry[1] < time.time():
         return None
     path = entry[0]
-    req = urllib.request.Request(BASE + "/api/files/" + urllib.parse.quote(path.lstrip("/"), safe="/"))
+    req = urllib.request.Request(_files_url(path))
     if TOKEN:
         req.add_header("Authorization", f"Bearer {TOKEN}")
     return os.path.basename(path), urllib.request.urlopen(req, timeout=60)

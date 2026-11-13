@@ -9,11 +9,14 @@ an MCP client such as Claude can manage datasets, run training jobs and inspect 
 | Area | Tools |
 |---|---|
 | System | `gpu_status`, `list_queues`, `queue_control` |
-| Jobs | `list_jobs`, `get_job`, `create_job`, `clone_job`, `start_job`, `stop_job`, `job_log` |
+| Jobs | `list_presets`, `new_job`, `list_jobs`, `get_job`, `create_job`, `clone_job`, `start_job`, `stop_job`, `job_log` |
 | Results | `job_samples`, `get_sample`, `job_files`, `job_loss` |
 | Datasets | `list_datasets`, `list_dataset_images`, `add_to_dataset`, `request_upload`, `set_captions`, `get_caption` |
 
-A job queued with `start_job` only runs once its GPU queue is running (`list_queues` → `queue_control`).
+`new_job` builds a LoRA job from a preset (`flux2_dev_lora`, `flex1_lora`) with dotted-path
+`overrides`, and can start it in one call. `start_job` also starts the job's GPU queue if it is
+stopped (pass `start_queue=false` to skip). Preset paths are as seen inside the ai-toolkit
+container (`AITK_CONTAINER_ROOT`, default `/app/ai-toolkit`).
 
 ## Modes
 
@@ -45,6 +48,7 @@ claude mcp add --transport http ai-toolkit http://<server>:8676/mcp
 | `AITK_TOKEN` | Bearer token for the UI, if it runs with `AI_TOOLKIT_AUTH` |
 | `AITK_MCP_AUTH` | HTTP mode only: `false`/`0`/`off` disables client auth. Default: on |
 | `AITK_MCP_TOKEN` | HTTP mode only: bearer token clients must send (required while auth is on) |
+| `AITK_CONTAINER_ROOT` | Path of ai-toolkit inside its container, used by job presets (default `/app/ai-toolkit`) |
 | `AITK_PUBLIC_URL` | HTTP mode only: base URL to put in upload links if the `Host` header isn't reachable |
 
 ## Docker Compose

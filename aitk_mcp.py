@@ -87,7 +87,26 @@ def create_job(a):
 
 
 def start_job(a):
-    return _slim(api("GET", f"/api/jobs/{a['id']}/start"))
+    """Queue the job and, unless start_queue=false, make sure its GPU queue is running."""
+    job = api("GET", f"/api/jobs/{a['id']}/start")
+    res = _slim(job)
+    if a.get("start_queue", True) is False:
+        res["queue"] = "not touched (start_queue=false)"
+        return res
+    gpu = (job or {}).get("gpu_ids")
+    queues = api("GET", "/api/queue").get("queues", [])
+    q = next((q for q in queues if q.get("gpu_ids") == gpu), None)
+    if q is None:  # the start route creates it, but we may have read before that landed
+        queues = api("GET", "/api/queue").get("queues", [])
+        q = next((q for q in queues if q.get("gpu_ids") == gpu), None)
+    if q is None:
+        res["queue"] = f"no queue found for gpu_ids={gpu}; check list_queues"
+    elif q.get("is_running"):
+        res["queue"] = f"queue {q['id']} already running"
+    else:
+        api("GET", f"/api/queue/{q['id']}/start")
+        res["queue"] = f"queue {q['id']} started"
+    return res
 
 
 def stop_job(a):
@@ -358,6 +377,102 @@ def clone_job(a):
     return _slim(api("POST", "/api/jobs", body=body))
 
 
+# ---- job presets ---------------------------------------------------------------
+# Paths are as seen INSIDE the ai-toolkit container (override with AITK_CONTAINER_ROOT).
+CONTAINER_ROOT = os.environ.get("AITK_CONTAINER_ROOT", "/app/ai-toolkit")
+
+
+def _sample_block(trigger, prompts=None, guidance=3.5, steps=25):
+    t = f"{trigger} " if trigger else ""
+    prompts = prompts or [
+        f"photo of {t}person, medium shot, clear features, high quality",
+        f"{t}person smiling, outdoors, natural light, portrait",
+        f"{t}person in a cafe, holding a coffee cup, candid photo",
+    ]
+    return {
+        "sampler": "flowmatch", "sample_every": 250, "sample_start_step": 0,
+        "width": 1024, "height": 1024,
+        "samples": [{"prompt": x} for x in prompts],
+        "neg": "", "seed": 42, "walk_seed": True,
+        "guidance_scale": guidance, "sample_steps": steps, "num_frames": 1, "fps": 1,
+    }
+
+
+def _preset_job(preset, name, dataset, trigger, steps):
+    ds = {
+        "folder_path": f"{CONTAINER_ROOT}/datasets/{dataset}", "mask_path": None, "mask_min_value": 0.1,
+        "default_caption": "", "caption_ext": "txt", "caption_dropout_rate": 0.05,
+        "cache_latents_to_disk": True, "is_reg": False, "network_weight": 1,
+        "resolution": [512, 768, 1024], "controls": [], "shrink_video_to_frames": True,
+        "num_frames": 1, "flip_x": False, "flip_y": False, "num_repeats": 1,
+    }
+    train = {
+        "batch_size": 1, "bypass_guidance_embedding": True, "steps": steps, "gradient_accumulation": 1,
+        "train_unet": True, "train_text_encoder": False, "gradient_checkpointing": True,
+        "noise_scheduler": "flowmatch", "optimizer": "adamw8bit", "timestep_type": "sigmoid",
+        "content_or_style": "balanced", "optimizer_params": {"weight_decay": 1e-4},
+        "unload_text_encoder": False, "cache_text_embeddings": False, "lr": 1e-4,
+        "ema_config": {"use_ema": False, "ema_decay": 0.99}, "skip_first_sample": False,
+        "force_first_sample": False, "disable_sampling": False, "dtype": "bf16",
+        "diff_output_preservation": False, "switch_boundary_every": 1, "loss_type": "mse",
+    }
+    if preset == "flux2_dev_lora":
+        # derived from a LoRA config proven on a GB10 (rank 32, convrot4 quant, EMA)
+        ds.update(caption_dropout_rate=0, resolution=[512, 768, 1024, 1280], num_repeats=2)
+        train.update(batch_size=2, bypass_guidance_embedding=False, gradient_accumulation=2,
+                     lr_scheduler="cosine", ema_config={"use_ema": True, "ema_decay": 0.99})
+        model = {"name_or_path": "black-forest-labs/FLUX.2-dev", "quantize": True, "qtype": "convrot4",
+                 "quantize_te": True, "qtype_te": "convrot4", "arch": "flux2", "low_vram": False,
+                 "model_kwargs": {"match_target_res": False}, "compile": True,
+                 "layer_offloading": False, "layer_offloading_text_encoder_percent": 1,
+                 "layer_offloading_transformer_percent": 1}
+        sample = _sample_block(trigger, guidance=3.5, steps=25)
+        sample["sample_at_end"] = True  # needs the fork's sample_at_end option
+    elif preset == "flex1_lora":
+        # the web UI's stock default job
+        model = {"name_or_path": "ostris/Flex.1-alpha", "quantize": True, "qtype": "qfloat8",
+                 "quantize_te": True, "qtype_te": "qfloat8", "arch": "flex1", "low_vram": False,
+                 "model_kwargs": {}, "compile": False}
+        sample = _sample_block(trigger, guidance=4, steps=30)
+    else:
+        raise RuntimeError(f"unknown preset {preset!r}; available: {sorted(PRESETS)}")
+    return {
+        "job": "extension",
+        "config": {"name": name, "process": [{
+            "type": "diffusion_trainer", "training_folder": f"{CONTAINER_ROOT}/output",
+            "sqlite_db_path": f"{CONTAINER_ROOT}/aitk_db.db", "device": "cuda",
+            "trigger_word": trigger or None, "performance_log_every": 10,
+            "network": {"type": "lora", "linear": 32, "linear_alpha": 32, "network_kwargs": {"ignore_if_contains": []}},
+            "save": {"dtype": "bf16", "save_every": 250, "max_step_saves_to_keep": 4, "save_format": "diffusers", "push_to_hub": False},
+            "datasets": [ds], "train": train,
+            "logging": {"log_every": 1, "use_ui_logger": True},
+            "model": model, "sample": sample,
+        }]},
+        "meta": {"name": "[name]", "version": "1.0"},
+    }
+
+
+PRESETS = {"flux2_dev_lora": "FLUX.2-dev LoRA, rank 32, convrot4 (from a GB10-proven config)", "flex1_lora": "UI default (Flex.1-alpha, qfloat8)"}
+
+
+def list_presets(a):
+    return PRESETS
+
+
+def new_job(a):
+    """Build a job from a preset, apply dotted-path overrides, create it, optionally start it."""
+    cfg = _preset_job(a.get("preset", "flux2_dev_lora"), a["name"], a["dataset"], a.get("trigger_word"), int(a.get("steps", 2500)))
+    for path, val in (a.get("overrides") or {}).items():
+        _set_path(cfg, path, val)
+    if a.get("dry_run"):
+        return {"job_config": cfg}
+    job = api("POST", "/api/jobs", body={"name": a["name"], "gpu_ids": str(a.get("gpu_ids", "0")), "job_config": cfg})
+    out = _slim(job)
+    if a.get("start"):
+        out["start"] = start_job({"id": job["id"]})
+    return out
+
+
 ID = {"id": {"type": "string", "description": "job id"}}
 TOOLS = {
     "gpu_status": (gpu_status, "GPU memory/utilisation as reported by the UI.", {}, []),
@@ -370,7 +485,7 @@ TOOLS = {
         {"name": {"type": "string"}, "gpu_ids": {"type": "string"}, "job_config": {"type": "object"}, "id": {"type": "string"}},
         ["name", "job_config"],
     ),
-    "start_job": (start_job, "Queue a job to run.", ID, ["id"]),
+    "start_job": (start_job, "Queue a job and start its GPU queue if stopped (start_queue=false to skip).", {**ID, "start_queue": {"type": "boolean"}}, ["id"]),
     "stop_job": (stop_job, "Gracefully stop a running job.", ID, ["id"]),
     "list_datasets": (list_datasets, "List dataset folders.", {}, []),
     "list_dataset_images": (list_dataset_images, "List image paths in a dataset.", {"dataset": {"type": "string"}, "limit": {"type": "integer"}}, ["dataset"]),
@@ -408,6 +523,14 @@ TOOLS = {
         "Create a new (not started) job from an existing job's config. overrides: {\"config.process.0.datasets.0.folder_path\": \"/app/ai-toolkit/datasets/x\", \"config.process.0.train.steps\": 2000}. Use list_jobs/get_job to find a source.",
         {"id": {"type": "string"}, "name": {"type": "string"}, "overrides": {"type": "object"}},
         ["id", "name"],
+    ),
+    "list_presets": (list_presets, "Available job presets for new_job.", {}, []),
+    "new_job": (
+        new_job,
+        "Create a LoRA training job from a preset in one call: name, dataset (folder name under datasets), optional trigger_word, steps, overrides (dotted paths, e.g. {\"config.process.0.network.linear\": 16}). start=true also queues it and starts the GPU queue. dry_run=true returns the config without creating. Check list_dataset_images first.",
+        {"name": {"type": "string"}, "dataset": {"type": "string"}, "preset": {"type": "string"}, "trigger_word": {"type": "string"},
+         "steps": {"type": "integer"}, "gpu_ids": {"type": "string"}, "overrides": {"type": "object"}, "start": {"type": "boolean"}, "dry_run": {"type": "boolean"}},
+        ["name", "dataset"],
     ),
     "queue_control": (
         queue_control,

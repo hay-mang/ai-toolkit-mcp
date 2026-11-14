@@ -28,15 +28,23 @@ It pairs `img.jpg` with `img.txt` and reports missing/empty captions, orphan `.t
 Fix errors (rename collisions, delete duplicates with the user's OK). Warnings are judgment calls: tell the user, e.g. under ~10-15 images usually trains poorly.
 
 ### 2. Caption what is missing
-Skip this if `check` says every image is captioned.
+Skip this if `check` says every image is captioned. Captions must exist on the server before training, and there are two ways to make them:
+
+**A. On the server (default for more than ~20 images): `caption_dataset`.** Upload the images first (step 3), then:
+1. `caption_dataset(dataset, style="lora")` starts ai-toolkit's own Qwen3-VL captioner on the GPU and writes `<image>.txt` for every image that has no caption (`recaption=true` overwrites existing ones). Styles: `lora` (describes what varies: setting, clothing, pose, framing, lighting; not the subject's fixed features), `detailed`, `short`, or pass your own `prompt`.
+2. It refuses if the GPU is busy; do not pass `force=true` unless the user says so (the captioner and a training run compete for unified memory). The first run loads the model, which takes a couple of minutes.
+3. Poll `caption_status(dataset)` (or `wait=true` with a timeout). When it completes, run `dataset_summary(dataset, full=true)` and read 5-10 captions with `get_caption`, spread across the set, alongside `get_dataset_image`. Show the user a few and fix style problems by re-running with a better `prompt` and `recaption=true`.
+4. Hand-fix individual captions with `set_captions`.
+
+**B. By hand (a handful of images, or when the user wants full control): write them yourself.**
 1. Agree on a style first. Write captions for 2-3 images, show them, get approval, then continue.
 2. View each uncaptioned image (read the image file) and write `<same name>.txt` next to it. Work in batches of about 10 and re-run `check`.
 3. Caption guidance for LoRAs: one plain sentence or two; describe what varies (setting, clothing, pose, framing, lighting, expression); do not describe the constant thing you want the LoRA to learn (a person's fixed facial features, a style's look); no tag lists or quality words unless the user wants them.
-   **Trigger word:** you do not need to write it into captions. With `trigger_word` set on the job, ai-toolkit prepends it to any caption that lacks it at training time, and replaces a literal `[trigger]` (or `[name]`) with it. Leave it out, or use `[trigger]` where you want it placed (e.g. `[trigger] sitting on a bench`). Do not mix styles: pick one.
-4. For hundreds of images, tell the user this costs a lot of tokens and offer to caption a sample plus let them supply captions another way.
-5. Never overwrite existing captions without asking.
+4. Never overwrite existing captions without asking.
 
-### 3. Upload
+**Trigger word:** you do not need to write it into captions. With `trigger_word` set on the job, ai-toolkit prepends it to any caption that lacks it at training time, and replaces a literal `[trigger]` (or `[name]`) with it. Leave it out, or use `[trigger]` where you want it placed (e.g. `[trigger] sitting on a bench`).
+
+### 3. Upload (do this before option A of step 2)
 1. `request_upload(dataset)` returns an upload URL (valid ~15 minutes, reusable until then).
 2. `python3 aitk_dataset.py upload FOLDER URL` sends images and captions in batches and fails loudly if any file is missing.
 3. `dataset_summary(dataset, full=true)` and compare the image count with `check`. Spot-check with `get_dataset_image` / `get_caption`. If the dataset already existed, say that new files were added or overwritten (same sanitised name replaces).
@@ -51,7 +59,7 @@ Skip this if `check` says every image is captioned.
 - `wait_for_job(id, timeout_seconds=120)` in a loop; report step progress at sensible intervals, not every poll.
 - `job_log` for problems, `job_loss` for the curve, `job_samples` + `get_sample` to look at images as they appear.
 - `job_control(id, "save_now"|"sample_now")` on request. `stop_job` is graceful; `job_control(id, "kill")` only if a stop hangs.
-- Stuck on `queued`: `list_queues`, `queue_control(queue_id, "start")`.
+- Stuck on `queued`: `list_queues`, then `queue_control(gpu_ids="0", action="start")` (queues are addressed by GPU string; `start_job` normally does this for you).
 
 ### 6. Review and deliver
 1. When finished, view several samples across checkpoints (early, middle, last) with `get_sample`. Say honestly what you see: likeness/style hit, overfitting (copying training images, burnt colours, loss of prompt following), artifacts. Recommend a checkpoint and why; the last one is not always best.
@@ -63,7 +71,7 @@ Skip this if `check` says every image is captioned.
 - **`validate_job` says dataset missing:** dataset names are folders directly under the datasets root.
 - **Upload URL rejected (403):** the ticket expired; call `request_upload` again.
 - **`job_control` route missing:** older UI build; use `stop_job` or the web UI.
-- **Job created but never starts:** the GPU queue was stopped; `start_job` starts it.
+- **Job created but never starts:** the GPU queue was stopped; `queue_control(gpu_ids, "start")`.
 
 ## Do not
 - Do not delete anything unless the user asked for that specific deletion.

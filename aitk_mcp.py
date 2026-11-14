@@ -93,23 +93,24 @@ def create_job(a):
 def start_job(a):
     """Queue the job and, unless start_queue=false, make sure its GPU queue is running."""
     job = api("GET", f"/api/jobs/{a['id']}/start")
+    # the start route answers with the job as it was BEFORE queueing; re-read for the real state
+    job = api("GET", "/api/jobs", {"id": a["id"]}) or job
     res = _slim(job)
     if a.get("start_queue", True) is False:
         res["queue"] = "not touched (start_queue=false)"
         return res
-    gpu = (job or {}).get("gpu_ids")
+    gpu = str((job or {}).get("gpu_ids"))
     queues = api("GET", "/api/queue").get("queues", [])
     q = next((q for q in queues if q.get("gpu_ids") == gpu), None)
-    if q is None:  # the start route creates it, but we may have read before that landed
+    if q is None:  # the start route creates the queue row; re-read in case that landed after our first read
         queues = api("GET", "/api/queue").get("queues", [])
         q = next((q for q in queues if q.get("gpu_ids") == gpu), None)
-    if q is None:
-        res["queue"] = f"no queue found for gpu_ids={gpu}; check list_queues"
-    elif q.get("is_running"):
-        res["queue"] = f"queue {q['id']} already running"
+    if q is not None and q.get("is_running"):
+        res["queue"] = f"queue for GPU {gpu} already running"
     else:
-        api("GET", f"/api/queue/{q['id']}/start")
-        res["queue"] = f"queue {q['id']} started"
+        # NOTE: the route param is the gpu_ids string (e.g. "0"), NOT the numeric queue id
+        api("GET", f"/api/queue/{urllib.parse.quote(gpu, safe='')}/start")
+        res["queue"] = f"queue for GPU {gpu} started"
     return res
 
 
@@ -118,7 +119,19 @@ def stop_job(a):
 
 
 def queue_control(a):
-    return api("GET", f"/api/queue/{a['queue_id']}/{a['action']}")
+    """Routes are keyed by the gpu_ids string (e.g. "0"). A numeric queue id from list_queues is mapped to it."""
+    if a["action"] not in ("start", "stop"):
+        raise RuntimeError("action must be start or stop")
+    gpu = a.get("gpu_ids")
+    if gpu is None and a.get("queue_id") is not None:
+        q = next((q for q in api("GET", "/api/queue").get("queues", []) if str(q.get("id")) == str(a["queue_id"])), None)
+        if not q:
+            raise RuntimeError(f"no queue with id {a['queue_id']}; see list_queues")
+        gpu = q["gpu_ids"]
+    if gpu is None:
+        raise RuntimeError("pass gpu_ids (e.g. \"0\") or queue_id")
+    api("GET", f"/api/queue/{urllib.parse.quote(str(gpu), safe='')}/{a['action']}")
+    return {"gpu_ids": str(gpu), "action": a["action"], "queues": api("GET", "/api/queue").get("queues")}
 
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -731,6 +744,100 @@ def stream_download(ticket, wfile_send):
     return os.path.basename(path), urllib.request.urlopen(req, timeout=60)
 
 
+# ---- server-side dataset captioning (ai-toolkit's captioner jobs) ---------------------
+CAPTION_PROMPTS = {
+    "detailed": ("Caption this image as if you were going to try to generate it with an image generator. Be thorough and "
+                 "describe everything in the image. Be decisive by stating things as they are. Do not say things like "
+                 "\"It appears that\" or \"possibly\". Start out with things like \"A person on the beach\" or \"A black "
+                 "dragon\". No preamble. Just get to the point."),
+    "short": ("Write one concise sentence describing this image for an image generator: the subject, setting, clothing, "
+              "pose and lighting. State things as they are. No hedging words, no preamble."),
+    "lora": ("Caption this image for training an image-generator LoRA, in one or two plain sentences. Describe what is "
+             "visible and varies between images: setting, background, clothing, pose, expression, camera framing and "
+             "lighting. Do not describe the subject's permanent physical features (face shape, eye colour, hair colour, "
+             "skin) or name the person. Be decisive; no hedging words, no preamble."),
+}
+CAPTION_TOKENS = {"detailed": 160, "short": 64, "lora": 110}
+CAPTIONERS = {"Qwen3VLCaptioner": "Qwen/Qwen3-VL-8B-Instruct"}
+
+
+def _datasets_root():
+    r = api("GET", "/api/settings")
+    root = (r or {}).get("DATASETS_FOLDER") if isinstance(r, dict) else None
+    return (root or f"{CONTAINER_ROOT}/datasets").rstrip("/")
+
+
+def _find_caption_job(ref):
+    try:
+        j = api("GET", "/api/jobs", {"job_ref": ref})
+    except RuntimeError:
+        return None
+    return j if isinstance(j, dict) and j.get("job_type") in (None, "caption") and j.get("id") else None
+
+
+def caption_dataset(a):
+    """Caption every image in a dataset on the server (ai-toolkit captioner job)."""
+    _safe_name(a["dataset"])
+    ds = a["dataset"]
+    style = a.get("style", "lora")
+    if style not in CAPTION_PROMPTS and not a.get("prompt"):
+        raise RuntimeError(f"style must be one of {sorted(CAPTION_PROMPTS)} (or pass prompt)")
+    captioner = a.get("captioner", "Qwen3VLCaptioner")
+    if captioner not in CAPTIONERS:
+        raise RuntimeError(f"captioner must be one of {sorted(CAPTIONERS)}")
+    imgs = api("POST", "/api/datasets/listImages", body={"datasetName": ds}).get("images", [])
+    if not imgs:
+        raise RuntimeError(f"dataset {ds!r} has no images")
+    # a captioner loads an 8B model: don't stack it on a running job unless told to
+    if not a.get("force"):
+        active = api("GET", "/api/jobs", {"only_active": "true"}).get("jobs", [])
+        busy = [j for j in active if j.get("gpu_ids") == str(a.get("gpu_ids", "0"))]
+        if busy:
+            return {"started": False, "reason": "GPU is busy with: " + ", ".join(f"{j.get('name')} ({j.get('status')})" for j in busy),
+                    "hint": "wait for it, or pass force=true"}
+    path = f"{_datasets_root()}/{ds}"
+    cfg = {
+        "job": "extension",
+        "config": {"name": f"Caption {ds}", "process": [{
+            "type": captioner, "sqlite_db_path": f"{CONTAINER_ROOT}/aitk_db.db", "device": "cuda",
+            "caption": {
+                "model_name_or_path": a.get("model", CAPTIONERS[captioner]), "dtype": "bf16", "quantize": False,
+                "low_vram": False, "extensions": ["jpg", "jpeg", "png", "bmp", "webp"], "path_to_caption": path,
+                "recaption": bool(a.get("recaption", False)), "compile": False, "caption_extension": "txt",
+                "caption_prompt": a.get("prompt") or CAPTION_PROMPTS[style],
+                "max_res": int(a.get("max_res", 512)), "max_new_tokens": int(a.get("max_new_tokens", CAPTION_TOKENS.get(style, 128))),
+                "batch_size": int(a.get("batch_size", 1)),
+            },
+        }]},
+    }
+    existing = _find_caption_job(path)
+    if existing and existing.get("status") in ("running", "queued", "stopping"):
+        return {"started": False, "reason": f"a caption job for {ds!r} is already {existing['status']}", "id": existing["id"]}
+    body = {"name": existing["name"] if existing else str(uuid.uuid4()), "gpu_ids": str(a.get("gpu_ids", "0")),
+            "job_config": cfg, "job_type": "caption", "job_ref": path}
+    if existing:
+        body["id"] = existing["id"]
+    job = api("POST", "/api/jobs", body=body)
+    out = start_job({"id": job["id"]})
+    out.update(started=True, images=len(imgs), dataset=ds, style=style if not a.get("prompt") else "custom prompt",
+               recaption=bool(a.get("recaption", False)),
+               next="poll caption_status(dataset) or wait_for_job(id); then dataset_summary(full=true) and get_caption to review")
+    if a.get("wait"):
+        out["result"] = wait_for_job({"id": job["id"], "timeout_seconds": a.get("timeout_seconds", 300)})
+    return out
+
+
+def caption_status(a):
+    _safe_name(a["dataset"])
+    path = f"{_datasets_root()}/{a['dataset']}"
+    j = _find_caption_job(path)
+    if not j:
+        return {"dataset": a["dataset"], "caption_job": None}
+    r = _slim(api("GET", "/api/jobs", {"id": j["id"]}))
+    r["dataset"] = a["dataset"]
+    return r
+
+
 ID = {"id": {"type": "string", "description": "job id"}}
 TOOLS = {
     "gpu_status": (gpu_status, "GPU memory/utilisation as reported by the UI.", {}, []),
@@ -802,11 +909,20 @@ TOOLS = {
     "validate_job": (validate_job, "Pre-flight check of a job (id) or a job_config: dataset exists/has images/captions, steps, model, GPU free memory.", {"id": {"type": "string"}, "job_config": {"type": "object"}}, []),
     "get_settings": (get_settings, "UI settings (datasets/training folders); secrets redacted.", {}, []),
     "request_download": (request_download, "Get a short-lived URL + curl command to pull a job's checkpoint or sample to the client machine without passing bytes through chat. path must come from job_files/job_samples. HTTP server only.", {**ID, "path": {"type": "string"}, "ttl_seconds": {"type": "integer"}}, ["id", "path"]),
+    "caption_dataset": (
+        caption_dataset,
+        "Caption every image in a dataset on the server with ai-toolkit's own captioner (Qwen3-VL, runs on the GPU, writes <image>.txt). style: lora (default; describes what varies, not fixed identity features), detailed, short; or pass prompt. recaption=true overwrites existing captions (default: only missing). Refuses if the GPU is busy unless force=true. wait=true blocks up to timeout_seconds. Use for larger datasets; for a handful, write captions yourself.",
+        {"dataset": {"type": "string"}, "style": {"type": "string", "enum": ["lora", "detailed", "short"]}, "prompt": {"type": "string"},
+         "model": {"type": "string"}, "recaption": {"type": "boolean"}, "max_new_tokens": {"type": "integer"}, "max_res": {"type": "integer"},
+         "gpu_ids": {"type": "string"}, "force": {"type": "boolean"}, "wait": {"type": "boolean"}, "timeout_seconds": {"type": "integer"}},
+        ["dataset"],
+    ),
+    "caption_status": (caption_status, "Status/progress of a dataset's captioning job.", {"dataset": {"type": "string"}}, ["dataset"]),
     "queue_control": (
         queue_control,
-        "Start or stop a GPU queue.",
-        {"queue_id": {"type": "string"}, "action": {"type": "string", "enum": ["start", "stop"]}},
-        ["queue_id", "action"],
+        "Start or stop a GPU queue, addressed by gpu_ids (e.g. \"0\"); a numeric queue_id from list_queues also works.",
+        {"gpu_ids": {"type": "string"}, "queue_id": {"type": "string"}, "action": {"type": "string", "enum": ["start", "stop"]}},
+        ["action"],
     ),
 }
 

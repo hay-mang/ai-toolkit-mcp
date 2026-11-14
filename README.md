@@ -20,6 +20,8 @@ an MCP client such as Claude can manage datasets, run training jobs and inspect 
 | `add_to_dataset` | `dataset`, `items[]` | Small batches. Item: `data` (base64) + `filename`, or `source` (URL), plus optional `caption` |
 | `set_captions` | `dataset`, `captions` | `{filename: text}`: write or overwrite captions |
 | `get_caption` | `dataset`, `filename` | Read one caption |
+| `caption_dataset` | `dataset`, `style?`, `prompt?`, `recaption?`, `wait?`, `force?` | Caption every image on the server with ai-toolkit's Qwen3-VL captioner (GPU). Styles: `lora`, `detailed`, `short` |
+| `caption_status` | `dataset` | Progress of the dataset's captioning job |
 
 ### Jobs
 | Command | Arguments | What it does |
@@ -52,7 +54,7 @@ an MCP client such as Claude can manage datasets, run training jobs and inspect 
 |---|---|---|
 | `gpu_status` | | GPU memory and utilisation |
 | `list_queues` | | GPU queues and whether each is running |
-| `queue_control` | `queue_id`, `action` | `start` or `stop` a queue |
+| `queue_control` | `gpu_ids` (or `queue_id`), `action` | `start` or `stop` a GPU queue (addressed by GPU string, e.g. `"0"`) |
 | `get_settings` | | UI folders and settings (secrets redacted) |
 
 ### Destructive (disabled unless `AITK_MCP_ALLOW_DELETE=true`)
@@ -71,7 +73,7 @@ The server cannot see your disk, so a small client-side helper does the folder w
 
 ```
 python3 aitk_dataset.py check  ./my_images --trigger K1er4     # captions paired? tiny/duplicate images? name collisions?
-# (fix problems / write missing .txt captions)
+# (fix problems; write missing .txt captions by hand, or upload first and use caption_dataset)
 # in your MCP client: request_upload(dataset="my_set")  -> prints an upload URL
 python3 aitk_dataset.py upload ./my_images <upload url>        # batched, verifies every file arrived
 ```
@@ -82,14 +84,14 @@ and captions lacking the trigger word (informational: ai-toolkit adds it at trai
 
 Then, from your MCP client:
 
-1. `dataset_summary(dataset, full=true)` to confirm the server sees what you sent.
+1. `dataset_summary(dataset, full=true)` to confirm the server sees what you sent. For images without captions, run `caption_dataset(dataset)` and review a few results.
 2. `new_job(..., dry_run=true)`, read the config, then again with `start=true`.
 3. `wait_for_job`, with `job_loss`, `job_log` and `get_sample` to watch progress.
 4. `job_files`, then `request_download` for the checkpoint you want.
 
 With the skill installed, ask Claude to "train a LoRA from ./my_images with trigger word K1er4": it runs these steps,
-writes missing captions itself by looking at the images (asking you to approve the style first), and asks before
-starting the run.
+captions missing ones (on the server for larger sets, or itself for a handful, asking you to approve the style
+first), and asks before starting the run.
 
 ## Skill
 
@@ -107,7 +109,11 @@ mkdir -p ~/.claude/skills && cp -r skill/ai-toolkit ~/.claude/skills/
 start a job with errors unless `force=true`. Preset paths are as seen inside the ai-toolkit container
 (`AITK_CONTAINER_ROOT`, default `/app/ai-toolkit`).
 
-`start_job` also starts the job's GPU queue, since a queued job on a stopped queue never runs.
+`start_job` also starts the job's GPU queue, since a queued job on a stopped queue never runs. Queue routes are keyed by the GPU string (`"0"`), not the numeric id shown by `list_queues`.
+
+`caption_dataset` creates a job of type `caption` (the same one the web UI's Caption button makes) using the Qwen3-VL captioner,
+which must be available to the server (`Qwen/Qwen3-VL-8B-Instruct` by default; downloaded on first use). It will not start while
+another job holds the GPU unless `force=true`.
 
 `job_control` actions depend on the UI version; a missing route is reported as such.
 

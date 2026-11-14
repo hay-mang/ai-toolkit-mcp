@@ -554,14 +554,15 @@ def dataset_summary(a):
     _safe_name(a["dataset"])
     r = api("POST", "/api/datasets/listImages", body={"datasetName": a["dataset"]})
     imgs, root = r.get("images", []), r.get("root", "")
-    n = int(a.get("sample", 10))
+    n = len(imgs) if a.get("full") else int(a.get("sample", 10))
+    n = min(n, 2000)
     pick = [imgs[round(i * (len(imgs) - 1) / max(n - 1, 1))] for i in range(min(n, len(imgs)))] if imgs else []
     missing, lens = [], []
     for im in dict.fromkeys(pick):
         txt = api("POST", "/api/caption/get", body={"imgPath": root + im, "ext": a.get("caption_ext", "txt")})
         txt = txt if isinstance(txt, str) else ""
         (lens.append(len(txt.split())) if txt.strip() else missing.append(im))
-    return {"images": len(imgs), "checked": len(pick), "missing_captions": missing,
+    return {"images": len(imgs), "checked": len(pick), "missing_captions": missing[:50], "missing_count": len(missing),
             "avg_caption_words": round(sum(lens) / len(lens), 1) if lens else 0}
 
 
@@ -664,8 +665,8 @@ def validate_job(a):
         info[f"dataset:{name}"] = sm
         if sm["images"] == 0:
             errors.append(f"dataset {name!r} has no images")
-        if sm["missing_captions"] and not ds.get("default_caption"):
-            warnings.append(f"dataset {name!r}: {len(sm['missing_captions'])}/{sm['checked']} sampled images have no caption (and no default_caption)")
+        if sm["missing_count"] and not ds.get("default_caption"):
+            warnings.append(f"dataset {name!r}: {sm['missing_count']}/{sm['checked']} sampled images have no caption (and no default_caption)")
         elif 0 < sm["images"] < 10:
             warnings.append(f"dataset {name!r} has only {sm['images']} images")
     tw = proc.get("trigger_word")
@@ -790,7 +791,7 @@ TOOLS = {
         ["name", "dataset"],
     ),
     "create_dataset": (create_dataset, "Create an empty dataset folder (add_to_dataset also creates on demand).", {"name": {"type": "string"}}, ["name"]),
-    "dataset_summary": (dataset_summary, "Image count + caption spot-check for a dataset.", {"dataset": {"type": "string"}, "sample": {"type": "integer"}}, ["dataset"]),
+    "dataset_summary": (dataset_summary, "Image count + caption check for a dataset. Samples ~10 images by default; full=true checks every caption (up to 2000).", {"dataset": {"type": "string"}, "sample": {"type": "integer"}, "full": {"type": "boolean"}}, ["dataset"]),
     "get_dataset_image": (get_dataset_image, "View one dataset image inline (<=3MB).", {"dataset": {"type": "string"}, "filename": {"type": "string"}}, ["dataset", "filename"]),
     "delete_image": (delete_image, "DESTRUCTIVE. Delete an image (and its caption). Needs AITK_MCP_ALLOW_DELETE=true on the server and confirm=<filename>.", {"dataset": {"type": "string"}, "filename": {"type": "string"}, "confirm": {"type": "string"}}, ["dataset", "filename", "confirm"]),
     "delete_dataset": (delete_dataset, "DESTRUCTIVE. Delete a whole dataset folder. Needs AITK_MCP_ALLOW_DELETE=true and confirm=<dataset name>.", {"dataset": {"type": "string"}, "confirm": {"type": "string"}}, ["dataset", "confirm"]),

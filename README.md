@@ -14,7 +14,7 @@ an MCP client such as Claude can manage datasets, run training jobs and inspect 
 | `list_datasets` | | Dataset folder names |
 | `create_dataset` | `name` | Create an empty dataset (`add_to_dataset` also creates on demand) |
 | `list_dataset_images` | `dataset`, `limit?` | Image filenames in a dataset |
-| `dataset_summary` | `dataset`, `sample?` | Image count and a caption spot-check (missing / average length) |
+| `dataset_summary` | `dataset`, `sample?`, `full?` | Image count and caption check (missing / average length); `full=true` checks every caption |
 | `get_dataset_image` | `dataset`, `filename` | View one image inline (up to 3MB) |
 | `request_upload` | `dataset`, `ttl_seconds?` | **Bulk path.** Returns an upload URL and a `curl` command; run it where the files are |
 | `add_to_dataset` | `dataset`, `items[]` | Small batches. Item: `data` (base64) + `filename`, or `source` (URL), plus optional `caption` |
@@ -64,21 +64,36 @@ an MCP client such as Claude can manage datasets, run training jobs and inspect 
 
 `confirm` must equal the filename, dataset name or job name.
 
-## Quick start: images to LoRA
+## Quick start: a folder of images to a LoRA
 
-1. `request_upload` the dataset, then run the returned `curl` with your images and `.txt` captions
-   (or `add_to_dataset` for a handful).
-2. `dataset_summary` to check counts and captions.
-3. `new_job` with `dry_run=true`, read the config, then run it again without `dry_run`
-   (`start=true` to launch).
-4. `wait_for_job`, plus `job_loss`, `job_log` and `get_sample` to watch progress.
-5. `job_files`, then `request_download` for the checkpoint you want.
+The server cannot see your disk, so a small client-side helper does the folder work:
+`scripts/aitk_dataset.py` (stdlib only; copy or `curl` it to the machine with the images).
 
-If you use Claude Code, install the bundled skill (below) and ask it to "train a LoRA from these images".
+```
+python3 aitk_dataset.py check  ./my_images --trigger K1er4     # captions paired? tiny/duplicate images? name collisions?
+# (fix problems / write missing .txt captions)
+# in your MCP client: request_upload(dataset="my_set")  -> prints an upload URL
+python3 aitk_dataset.py upload ./my_images <upload url>        # batched, verifies every file arrived
+```
+
+`check` pairs `img.jpg` with `img.txt` and reports missing or empty captions, orphan captions, images below
+`--min-size` (default 512px), duplicates, filenames that collide once the server replaces spaces and symbols with `_`,
+and captions lacking the trigger word. It exits 1 on errors, so it works in scripts too (`--json` for machine output).
+
+Then, from your MCP client:
+
+1. `dataset_summary(dataset, full=true)` to confirm the server sees what you sent.
+2. `new_job(..., dry_run=true)`, read the config, then again with `start=true`.
+3. `wait_for_job`, with `job_loss`, `job_log` and `get_sample` to watch progress.
+4. `job_files`, then `request_download` for the checkpoint you want.
+
+With the skill installed, ask Claude to "train a LoRA from ./my_images with trigger word K1er4": it runs these steps,
+writes missing captions itself by looking at the images (asking you to approve the style first), and asks before
+starting the run.
 
 ## Skill
 
-`skill/ai-toolkit/SKILL.md` teaches Claude the workflow above, the safety rules and the pitfalls. Install it where
+`skill/ai-toolkit/SKILL.md` teaches Claude the folder-to-LoRA workflow above, how to caption, the safety rules and the pitfalls. Install it where
 Claude can see it:
 
 ```

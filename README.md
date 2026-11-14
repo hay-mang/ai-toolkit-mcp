@@ -78,7 +78,7 @@ python3 aitk_dataset.py upload ./my_images <upload url>        # batched, verifi
 
 `check` pairs `img.jpg` with `img.txt` and reports missing or empty captions, orphan captions, images below
 `--min-size` (default 512px), duplicates, filenames that collide once the server replaces spaces and symbols with `_`,
-and captions lacking the trigger word. It exits 1 on errors, so it works in scripts too (`--json` for machine output).
+and captions lacking the trigger word (informational: ai-toolkit adds it at training time). It exits 1 on errors, so it works in scripts too (`--json` for machine output).
 
 Then, from your MCP client:
 

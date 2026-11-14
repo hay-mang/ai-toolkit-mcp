@@ -127,7 +127,7 @@ def check(folder, trigger=None, min_size=512):
     if rep["duplicates"]:
         warnings.append(f"{len(rep['duplicates'])} duplicate image(s)")
     if rep["no_trigger"]:
-        warnings.append(f"{len(rep['no_trigger'])} caption(s) do not contain the trigger word {trigger!r}")
+        warnings.append(f"{len(rep['no_trigger'])} caption(s) lack the trigger word {trigger!r} (info: ai-toolkit prepends it at training time, so this is optional)")
     if 0 < len(images) < 10:
         warnings.append(f"only {len(images)} images; results are usually poor below ~10-15")
     if words:

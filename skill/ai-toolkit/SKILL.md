@@ -24,14 +24,15 @@ Ask the user for: the folder, a dataset name (letters/digits/`._-`), a trigger w
 ```
 python3 aitk_dataset.py check FOLDER --trigger WORD
 ```
-It pairs `img.jpg` with `img.txt` and reports missing/empty captions, orphan `.txt` files, small images, duplicates, names that collide once the server sanitises them (spaces and symbols become `_`), and captions lacking the trigger word. Exit code 1 means errors.
+It pairs `img.jpg` with `img.txt` and reports missing/empty captions, orphan `.txt` files, small images, duplicates, names that collide once the server sanitises them (spaces and symbols become `_`), and captions lacking the trigger word (informational only). Exit code 1 means errors.
 Fix errors (rename collisions, delete duplicates with the user's OK). Warnings are judgment calls: tell the user, e.g. under ~10-15 images usually trains poorly.
 
 ### 2. Caption what is missing
 Skip this if `check` says every image is captioned.
 1. Agree on a style first. Write captions for 2-3 images, show them, get approval, then continue.
 2. View each uncaptioned image (read the image file) and write `<same name>.txt` next to it. Work in batches of about 10 and re-run `check`.
-3. Caption guidance for LoRAs: one plain sentence or two; start with the trigger word if there is one; describe what varies (setting, clothing, pose, framing, lighting, expression); do not describe the constant thing you want the LoRA to learn (a person's fixed facial features, a style's look); no tags lists or quality words unless the user wants them.
+3. Caption guidance for LoRAs: one plain sentence or two; describe what varies (setting, clothing, pose, framing, lighting, expression); do not describe the constant thing you want the LoRA to learn (a person's fixed facial features, a style's look); no tag lists or quality words unless the user wants them.
+   **Trigger word:** you do not need to write it into captions. With `trigger_word` set on the job, ai-toolkit prepends it to any caption that lacks it at training time, and replaces a literal `[trigger]` (or `[name]`) with it. Leave it out, or use `[trigger]` where you want it placed (e.g. `[trigger] sitting on a bench`). Do not mix styles: pick one.
 4. For hundreds of images, tell the user this costs a lot of tokens and offer to caption a sample plus let them supply captions another way.
 5. Never overwrite existing captions without asking.
 
